@@ -61,3 +61,16 @@ async def answer_with_rag(user_text: str) -> str:
         r.raise_for_status()
         data = r.json()
         return data["choices"][0]["message"]["content"].strip()
+
+# app/rag.py (fragmento)
+from app.providers import GroqClient
+_groq = GroqClient()
+
+def answer_with_rag(question: str, context_chunks):
+    # arma el prompt RAG
+    ctx = "\n\n".join(context_chunks) if context_chunks else "N/A"
+    messages = [
+        {"role": "system", "content": "Eres el asistente virtual oficial de la CCP. Responde breve y preciso."},
+        {"role": "user", "content": f"Contexto:\n{ctx}\n\nPregunta: {question}"}
+    ]
+    return _groq.chat(messages, max_tokens=512, temperature=0.2)
