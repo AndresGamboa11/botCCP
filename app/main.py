@@ -63,6 +63,8 @@ async def webhook(request: Request):
         return JSONResponse({"ok": True})
     except Exception as e:
         return JSONResponse({"ok": False, "error": str(e)}, status_code=200)
+# incluye MCP
+app.include_router(mcp_router)  # << IMPORTANTE
 
 @app.get("/healthz")
 def healthz():
