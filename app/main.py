@@ -1,114 +1,69 @@
-import os, json, asyncio
-from typing import Any, Dict
-from fastapi import FastAPI, Request, Query
+# app/main.py
+import json
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
-from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.cors import CORSMiddleware
 
 from app.settings import get_settings
-from app.rag import answer_with_rag
 from app.whatsapp import send_whatsapp_text
-
-from app.ingest_qdrant import search_docs
-
-docs = search_docs(text)  # busca los fragmentos relevantes
-answer = answer_with_rag(text, docs)
+from app.rag import answer_with_rag
+from app.mcp_server import router as mcp_router
 
 S = get_settings()
-app = FastAPI(title="CCP Chatbot")
+app = FastAPI(title="Chatbot CCP (Render)")
+app.include_router(mcp_router)
 
-# --------- estático (opcional) ----------
-app.mount("/static", StaticFiles(directory="static", check_dir=False), name="static")
+# CORS básico
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 @app.get("/")
 def home():
-    return {"ok": True, "service": "Chatbot CCP online"}
+    return {"ok": True, "service": "Chatbot CCP online ✅"}
 
-# ---------- Verificación Webhook (GET) ----------
+# ------------ Verificación Webhook (GET) ------------
 @app.get("/webhook")
-def verify(
-    hub_mode: str | None = Query(None, alias="hub.mode"),
-    hub_challenge: str | None = Query(None, alias="hub.challenge"),
-    hub_verify_token: str | None = Query(None, alias="hub.verify_token"),
-    mode: str | None = Query(None),
-    challenge: str | None = Query(None),
-    verify_token: str | None = Query(None),
-):
-    m = hub_mode or mode or ""
-    t = hub_verify_token or verify_token or ""
-    c = hub_challenge or challenge or ""
-    if m == "subscribe" and t == S.WA_VERIFY_TOKEN:
-        return PlainTextResponse(c or "", status_code=200)
-    return PlainTextResponse("Error de verificación", status_code=403)
+def verify(mode: str = "", hub_mode: str = "", hub_challenge: str = "", hub_verify_token: str = ""):
+    token = hub_verify_token or ""
+    if token == S.TOKEN_VERIFICACION_WA:
+        return PlainTextResponse(hub_challenge or "")
+    return PlainTextResponse("403", status_code=403)
 
-# ---------- Util: extraer texto de distintos tipos ----------
-def extract_text_from_message(msg: Dict[str, Any]) -> str:
-    """
-    Soporta:
-      - {"type":"text","text":{"body":"..."}}
-      - {"type":"interactive","interactive":{"type":"list_reply"/"button_reply", "title"/"id"}}
-      - {"type":"button","button":{"text":"..."}}
-    """
-    mtype = msg.get("type")
-    if mtype == "text":
-        return (msg.get("text") or {}).get("body", "") or ""
-    if mtype == "interactive":
-        inter = msg.get("interactive") or {}
-        itype = inter.get("type")
-        if itype == "list_reply":
-            # título visible del ítem seleccionado
-            return (inter.get("list_reply") or {}).get("title", "") or ""
-        if itype == "button_reply":
-            return (inter.get("button_reply") or {}).get("title", "") or ""
-    if mtype == "button":
-        return (msg.get("button") or {}).get("text", "") or ""
-    # Fallback: algunos clientes envían "text" fuera
-    return (msg.get("text") or {}).get("body", "") or ""
-
-# ---------- Recepción de mensajes (POST) ----------
+# ------------ Recepción de mensajes (POST) ----------
 @app.post("/webhook")
-async def webhook(req: Request):
+async def webhook(request: Request):
     try:
-        body = await req.json()
-        # Logs básicos para depurar en Render (ver en Logs):
-        print("Incoming body:", json.dumps(body, ensure_ascii=False))
-
-        value = body.get("entry", [{}])[0].get("changes", [{}])[0].get("value", {})
-        statuses = value.get("statuses", [])
-        if statuses:
-            # acuses de recibo de WhatsApp → ignorar
-            return JSONResponse({"ok": True, "status_event": True})
-
+        body = await request.json()
+        # Navegar el payload típico de WhatsApp Cloud
+        entry = body.get("entry", [])[0]
+        changes = entry.get("changes", [])[0]
+        value = changes.get("value", {})
         messages = value.get("messages", [])
         if not messages:
-            return JSONResponse({"ignored": True})
+            return JSONResponse({"status": "no-message"}, status_code=200)
 
         msg = messages[0]
-        from_number = msg.get("from", "")
-        user_text = extract_text_from_message(msg).strip()
+        from_number = msg.get("from")
+        mtype = msg.get("type")
+        text = ""
+        if mtype == "text":
+            text = msg["text"]["body"]
+        elif mtype == "interactive":
+            text = msg["interactive"]["list_reply"]["title"] if "list_reply" in msg["interactive"] else ""
+        else:
+            text = ""
 
-        if not user_text:
-            await send_whatsapp_text(from_number, "Envíame tu consulta en texto.")
-            return JSONResponse({"ok": True, "empty": True})
-
-        # -------- RAG ----------
-        try:
-            answer = await answer_with_rag(user_text)
-        except Exception as e:
-            print("RAG error:", str(e))
-            answer = "Tu consulta fue recibida, pero hubo un problema temporal al generar la respuesta. Intenta nuevamente."
-
-        # -------- Responder por WhatsApp ----------
-        resp = await send_whatsapp_text(from_number, answer)
-        print("Send WA resp:", resp)   # ver si Graph devuelve 200/400 en Render Logs
-
+        # Generar respuesta
+        reply = await answer_with_rag(text or "")
+        await send_whatsapp_text(from_number, reply)
         return JSONResponse({"ok": True})
-
     except Exception as e:
-        print("Webhook error:", str(e))
-        # WhatsApp espera 200 siempre para no reintentar en loop
         return JSONResponse({"ok": False, "error": str(e)}, status_code=200)
 
-# ---------- Health ----------
 @app.get("/healthz")
 def healthz():
     return {"status": "ok"}
