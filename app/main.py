@@ -67,3 +67,17 @@ async def webhook(request: Request):
 @app.get("/healthz")
 def healthz():
     return {"status": "ok"}
+
+
+@app.get("/debug/rag")
+async def debug_rag(q: str = ""):
+    """
+    Diagnóstico de RAG. Ej: /debug/rag?q=horarios de atención
+    """
+    if not q.strip():
+        return JSONResponse({"error": "falta parámetro q"}, status_code=400)
+    try:
+        ans = await answer_with_rag(q)  # si tu función no es async: ans = answer_with_rag(q)
+        return {"query": q, "answer": ans}
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
