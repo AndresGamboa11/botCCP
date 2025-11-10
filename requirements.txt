@@ -6,5 +6,4 @@ pydantic==2.9.2
 pydantic-settings==2.6.1
 pypdf==4.3.1
 qdrant-client==1.9.2
-fastembed==0.3.1
 numpy==1.26.4
