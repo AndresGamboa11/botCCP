@@ -1,14 +1,15 @@
 # ingest/ingest_ccp.py
 # -*- coding: utf-8 -*-
 """
-Ingesta de CAMARA.pdf a Qdrant Cloud usando embeddings locales (sentence-transformers)
-con fallback a Hugging Face Inference API (endpoint nuevo).
+Ingesta de CAMARA.pdf a Qdrant Cloud usando embeddings EN LA NUBE (Hugging Face Inference).
+No requiere sentence-transformers local.
 
 Requiere en .env:
 QDRANT_URL=https://<tu-id>.<region>.qdrant.io
 QDRANT_API_KEY=<tu_api_key>
 QDRANT_COLLECTION=ccp_docs
-HF_API_TOKEN=hf_xxx (https://huggingface.co/settings/tokens)
+
+HF_API_TOKEN=hf_xxx
 HF_EMBED_MODEL=intfloat/multilingual-e5-small   (recomendado, multilingüe)
 """
 
@@ -19,28 +20,21 @@ import time
 import argparse
 from typing import List, Any, Iterable, Tuple
 
-import httpx
 from dotenv import load_dotenv
 from pypdf import PdfReader
 from qdrant_client import QdrantClient, models
-from app.hf_embed import hf_embed
 
-# ...
-vectors = hf_embed(textos, model=HF_EMBED_MODEL, batch_size=32)
-# -------- Cargar .env (forzar override) --------
+# Usamos la misma ruta de embeddings cloud que en app/rag.py
+from app.rag import hf_embed_texts_cloud, HF_EMBED_MODEL
+
+# -------- Cargar .env (forzar override para CLI) --------
 load_dotenv(override=True)
 
-HF_API_TOKEN   = os.getenv("HF_API_TOKEN", "").strip()
-HF_EMBED_MODEL = os.getenv("HF_EMBED_MODEL", "intfloat/multilingual-e5-small").strip()
-
-print("📦 Modelo embeddings activo:", HF_EMBED_MODEL)
-
-# ---------------- Utilidades ----------------
 def root_dir() -> str:
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 def load_env() -> None:
-    load_dotenv(os.path.join(root_dir(), ".env"))
+    load_dotenv(os.path.join(root_dir(), ".env"), override=True)
 
 def clean_text(s: str) -> str:
     if not s:
@@ -86,69 +80,24 @@ def batched(iterable: Iterable[Any], n: int) -> Iterable[List[Any]]:
     if batch:
         yield batch
 
-# --------------- Embeddings (local + fallback HF) ---------------
-def embed_texts_sync(texts, hf_token: str, model: str):
+# ---------------- Embeddings (solo nube) ----------------
+def embed_texts_cloud_batched(texts: List[str], model: str, batch_size: int = 64) -> List[List[float]]:
     """
-    Estrategia:
-      A) Local con sentence-transformers (rápido/estable; sin API)
-      B) Fallback a Hugging Face /pipeline/feature-extraction/{model}
+    Envuelve hf_embed_texts_cloud en lotes para evitar timeouts y respuestas enormes.
     """
-    if not texts:
-        return []
-
-    # ---------- A) Local: sentence-transformers ----------
-    try:
-        from sentence_transformers import SentenceTransformer
-        st = SentenceTransformer(model, device="cpu")
-        vecs = st.encode(texts, normalize_embeddings=True, batch_size=32, convert_to_numpy=False)
-        return [[float(x) for x in v] for v in vecs]
-    except Exception as e_local:
-        print("⚠️ Embeddings locales fallaron, intento con HF:", str(e_local))
-
-    # ---------- B) HF nuevo endpoint ----------
-    headers = {"Authorization": f"Bearer {hf_token}", "Content-Type": "application/json"}
-    payload = {"inputs": texts, "options": {"wait_for_model": True}}
-    url = f"https://api-inference.huggingface.co/pipeline/feature-extraction/{model}"
-
-    r = httpx.post(url, headers=headers, json=payload, timeout=60)
-    r.raise_for_status()
-    data = r.json()
-
-    # parseo simple (mean-pooling si vienen por tokens)
-    def mean_pool(mat):
-        if not mat:
-            return []
-        dims = len(mat[0])
-        sums = [0.0] * dims
-        n = 0
-        for row in mat:
-            if len(row) != dims:
-                continue
-            for i, v in enumerate(row):
-                sums[i] += float(v)
-            n += 1
-        return [s / (n or 1) for s in sums]
-
-    if isinstance(data, list):
-        # [[tok_dim], [tok_dim], ...] => tokens de una entrada
-        if data and isinstance(data[0], list) and data[0] and isinstance(data[0][0], (int, float)):
-            return [mean_pool(data)]
-        # [ [ [tok_dim], ... ] ] => lista envolvente con tokens
-        if data and isinstance(data[0], list) and data[0] and isinstance(data[0][0], list):
-            return [mean_pool(data[0])]
-        # [float, float, ...] => vector directo
-        if data and isinstance(data[0], (int, float)):
-            return [[float(x) for x in data]]
-
-    if isinstance(data, dict) and "data" in data:
-        out = []
-        for item in data["data"]:
-            if isinstance(item, dict) and "embedding" in item:
-                out.append([float(x) for x in item["embedding"]])
-        if out:
-            return out
-
-    raise RuntimeError("Formato de respuesta de HF no reconocido.")
+    out: List[List[float]] = []
+    for chunk in batched(texts, batch_size):
+        vecs = hf_embed_texts_cloud(chunk, model=model)
+        if not vecs or len(vecs) != len(chunk):
+            # hf_embed_texts_cloud puede devolver un solo vector si solo hay 1 texto;
+            # aquí garantizamos alineación 1:1.
+            if len(chunk) == 1 and vecs:
+                out.extend(vecs)
+            else:
+                raise RuntimeError("HF no devolvió la misma cantidad de vectores que textos.")
+        else:
+            out.extend(vecs)
+    return out
 
 # ---------------- Ingesta principal ----------------
 def main():
@@ -157,15 +106,15 @@ def main():
     QDRANT_URL = os.getenv("QDRANT_URL", "").strip()
     QDRANT_API_KEY = os.getenv("QDRANT_API_KEY", "").strip()
     COLLECTION = os.getenv("QDRANT_COLLECTION", "ccp_docs").strip()
-    HF_TOKEN = os.getenv("HF_API_TOKEN", "").strip()
 
     pdf_default = os.path.join(root_dir(), "knowledge", "CAMARA.pdf")
 
-    parser = argparse.ArgumentParser(description="Ingesta de PDF a Qdrant Cloud (HF embeddings)")
+    parser = argparse.ArgumentParser(description="Ingesta de PDF a Qdrant Cloud (HF embeddings nube)")
     parser.add_argument("--pdf", default=pdf_default, help="Ruta del PDF (default: knowledge/CAMARA.pdf)")
     parser.add_argument("--collection", default=COLLECTION, help="Nombre de colección (default: ccp_docs)")
     parser.add_argument("--no-recreate", action="store_true", help="No recrear la colección si ya existe")
-    parser.add_argument("--batch-size", type=int, default=64, help="Tamaño de lote para upsert")
+    parser.add_argument("--batch-size", type=int, default=64, help="Tamaño de lote para upsert a Qdrant")
+    parser.add_argument("--embed-batch", type=int, default=64, help="Tamaño de lote para llamadas HF")
     args = parser.parse_args()
 
     if not QDRANT_URL or not QDRANT_API_KEY:
@@ -184,8 +133,8 @@ def main():
     chunks = [c for c, _ in chunks_with_page]
     print(f"✅ Fragmentos: {len(chunks)}")
 
-    print(f"🧠 Generando embeddings con HF: {HF_EMBED_MODEL}")
-    vectors = embed_texts_sync(chunks, HF_TOKEN, HF_EMBED_MODEL)
+    print(f"🧠 Generando embeddings en la nube con HF: {HF_EMBED_MODEL}")
+    vectors = embed_texts_cloud_batched(chunks, model=HF_EMBED_MODEL, batch_size=args.embed_batch)
     if not vectors:
         print("❌ No se generaron embeddings")
         sys.exit(1)
@@ -197,19 +146,17 @@ def main():
 
     if not args.no_recreate:
         print(f"🧺 Recreando colección '{args.collection}'…")
-        # recreación segura (sin usar recreate_collection, que está deprecado)
+        # recreación segura
         try:
             client.get_collection(args.collection)
             client.delete_collection(args.collection)
         except Exception:
-            # si no existe, ignorar
-            pass
+            pass  # no existía
         client.create_collection(
             collection_name=args.collection,
             vectors_config=models.VectorParams(size=vector_dim, distance=models.Distance.COSINE),
         )
     else:
-        # usar colección existente o crear si no existe
         try:
             client.get_collection(args.collection)
             print(f"📦 Usando colección existente: {args.collection}")
