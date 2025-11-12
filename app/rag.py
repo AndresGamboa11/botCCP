@@ -210,8 +210,13 @@ def hf_embed_texts_cloud(texts: List[str], model: str) -> List[List[float]]:
     raise RuntimeError(f"HF embeddings falló: {last_err}")
 
 def _embed_query_cloud(text: str) -> List[float]:
-    vecs = hf_embed_texts_cloud([text], HF_EMBED_MODEL)
+    try:
+        vecs = hf_embed_texts_cloud([text], HF_EMBED_MODEL)
+    except Exception as e_cloud:
+        log.warning("Falla en router HF, intento local: %s", e_cloud)
+        vecs = hf_embed_texts_local([text], HF_EMBED_MODEL)
     return vecs[0]
+
 
 # ─────────────────────────────────────────────────────────────
 # BÚSQUEDA EN QDRANT
