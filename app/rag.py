@@ -1,14 +1,21 @@
-# app/rag.py  — SOLO nube (HF Inference API) + Qdrant + Groq
-import os, math, json, logging, time
+# app/rag.py — SOLO nube (HF Inference API) + Qdrant + Groq
+import os, math, logging, time
 from typing import List, Dict, Any
 
 import httpx
-from dotenv import load_dotenv
+from dotenv import load_dotenv, find_dotenv
 from qdrant_client import QdrantClient
 
-load_dotenv(override=True)
+# ─────────────────────────────────────────────────────────────
+# Carga .env solo si existe y SIN override (no pisar Render)
+# ─────────────────────────────────────────────────────────────
+_dotenv = find_dotenv(usecwd=True)
+if _dotenv:
+    load_dotenv(_dotenv, override=False)
 
-# ---------------- ENV ----------------
+# ─────────────────────────────────────────────────────────────
+# ENV
+# ─────────────────────────────────────────────────────────────
 QDRANT_URL        = (os.getenv("QDRANT_URL") or "").strip()
 QDRANT_API_KEY    = (os.getenv("QDRANT_API_KEY") or "").strip()
 QDRANT_COLLECTION = (os.getenv("QDRANT_COLLECTION") or "ccp_docs").strip()
@@ -19,17 +26,28 @@ HF_EMBED_MODEL    = (os.getenv("HF_EMBED_MODEL") or "intfloat/multilingual-e5-sm
 GROQ_API_KEY      = (os.getenv("GROQ_API_KEY") or "").strip()
 GROQ_MODEL        = (os.getenv("GROQ_MODEL") or "gemma2-9b-it").strip()
 
-# ---------------- LOG ----------------
-log = logging.getLogger("rag")
-log.setLevel(logging.INFO)
-
-# ---------------- QDRANT ----------------
-_client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, timeout=90)
-
-# ---------------- HF CLOUD EMBEDDINGS (solo nube) ----------------
 HF_TIMEOUT = float(os.getenv("HF_TIMEOUT", "60"))
 HF_RETRIES = int(os.getenv("HF_RETRIES", "2"))
 
+# ─────────────────────────────────────────────────────────────
+# LOG
+# ─────────────────────────────────────────────────────────────
+log = logging.getLogger("rag")
+if not log.handlers:
+    logging.basicConfig(level=logging.INFO)
+log.setLevel(logging.INFO)
+
+# ─────────────────────────────────────────────────────────────
+# Qdrant (lazy) — para fallar con mensaje claro si faltan env
+# ─────────────────────────────────────────────────────────────
+def _qdrant() -> QdrantClient:
+    if not QDRANT_URL or not QDRANT_API_KEY:
+        raise RuntimeError("Faltan QDRANT_URL o QDRANT_API_KEY en el entorno.")
+    return QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, timeout=90)
+
+# ─────────────────────────────────────────────────────────────
+# HF CLOUD EMBEDDINGS (solo nube)
+# ─────────────────────────────────────────────────────────────
 def _mean_pool_2d(vectors_2d: List[List[float]]) -> List[float]:
     if not vectors_2d:
         return []
@@ -51,17 +69,14 @@ def _normalize(vec: List[float]) -> List[float]:
     return [x / norm for x in vec]
 
 def _parse_hf_feature_response(data: Any) -> List[List[float]]:
-    # Soporta: tokens x dim → mean-pooling; vector directo; formato {"data":[{"embedding":[...]}]}
+    # Soporta: tokens x dim → mean-pooling; vector 1D; {"data":[{"embedding":[...]}]}
     if isinstance(data, list) and not data:
         return []
     if isinstance(data, list):
-        # Una entrada como matriz tokens x dim
         if data and isinstance(data[0], list) and data[0] and isinstance(data[0][0], (int, float)):
             return [_normalize(_mean_pool_2d(data))]
-        # Lista envolvente: [ [tokens x dim], ... ] -> tomamos la primera
         if data and isinstance(data[0], list) and data[0] and isinstance(data[0][0], list):
             return [_normalize(_mean_pool_2d(data[0]))]
-        # Vector 1D
         if data and isinstance(data[0], (int, float)):
             return [_normalize([float(x) for x in data])]
     if isinstance(data, dict) and "data" in data:
@@ -75,9 +90,8 @@ def _parse_hf_feature_response(data: Any) -> List[List[float]]:
 
 def hf_embed_texts_cloud(texts: List[str], model: str, token: str) -> List[List[float]]:
     """
-    Llama SOLO al endpoint nuevo de HF:
+    Endpoint correcto de HF (no usar /models):
       POST https://api-inference.huggingface.co/pipeline/feature-extraction/{model}
-    Sin librerías locales. Con reintentos breves.
     """
     if not texts:
         return []
@@ -86,12 +100,10 @@ def hf_embed_texts_cloud(texts: List[str], model: str, token: str) -> List[List[
     payload = {"inputs": texts, "options": {"wait_for_model": True}}
 
     last_err = None
-    for attempt in range(1, HF_RETRIES + 2):  # e.g., 1 intento + HF_RETRIES reintentos
+    for attempt in range(1, HF_RETRIES + 2):
         try:
             with httpx.Client(timeout=HF_TIMEOUT) as cli:
                 r = cli.post(url, headers=headers, json=payload)
-            # Si el modelo no está permitido en el endpoint viejo, 410 —> este endpoint no debería dar 410,
-            # pero por si HF lo devolviera, no hay fallback a /models ni a local (política: NADA local).
             r.raise_for_status()
             vecs = _parse_hf_feature_response(r.json())
             if not vecs:
@@ -99,6 +111,7 @@ def hf_embed_texts_cloud(texts: List[str], model: str, token: str) -> List[List[
             return vecs
         except Exception as e:
             last_err = e
+            log.warning("[HF] intento %s falló: %s", attempt, e)
             if attempt <= HF_RETRIES:
                 time.sleep(1.2 * attempt)
                 continue
@@ -107,13 +120,16 @@ def hf_embed_texts_cloud(texts: List[str], model: str, token: str) -> List[List[
 
 def _embed_query_cloud(text: str) -> List[float]:
     if not HF_API_TOKEN:
-        raise RuntimeError("Falta HF_API_TOKEN para embeddings en la nube.")
+        raise RuntimeError("Falta HF_API_TOKEN para incrustaciones en la nube.")
     vecs = hf_embed_texts_cloud([text], HF_EMBED_MODEL, HF_API_TOKEN)
     return vecs[0]
 
-# ---------------- BÚSQUEDA EN QDRANT ----------------
+# ─────────────────────────────────────────────────────────────
+# BÚSQUEDA EN QDRANT
+# ─────────────────────────────────────────────────────────────
 def _search(qvec: List[float], top_k: int = 5) -> List[Dict[str, Any]]:
-    hits = _client.search(collection_name=QDRANT_COLLECTION, query_vector=qvec, limit=top_k)
+    client = _qdrant()
+    hits = client.search(collection_name=QDRANT_COLLECTION, query_vector=qvec, limit=top_k)
     out = []
     for h in hits:
         p = h.payload or {}
@@ -125,7 +141,9 @@ def _search(qvec: List[float], top_k: int = 5) -> List[Dict[str, Any]]:
         })
     return out
 
-# ---------------- PROMPT ----------------
+# ─────────────────────────────────────────────────────────────
+# PROMPT
+# ─────────────────────────────────────────────────────────────
 SYSTEM = (
     "Eres el asistente oficial de la Cámara de Comercio de Pamplona (Colombia). "
     "Responde SOLO sobre servicios, trámites, horarios y actividades de la Cámara. "
@@ -150,7 +168,9 @@ def _build_prompt(user_q: str, passages: List[Dict[str, Any]]) -> str:
         f"- No inventes datos ni enlaces."
     )
 
-# ---------------- LLM (Groq) ----------------
+# ─────────────────────────────────────────────────────────────
+# LLM (Groq)
+# ─────────────────────────────────────────────────────────────
 def _llm_answer(prompt: str) -> str:
     if not GROQ_API_KEY:
         return "⚠️ Falta GROQ_API_KEY en el entorno."
@@ -171,19 +191,27 @@ def _llm_answer(prompt: str) -> str:
         data = r.json()
         return (data["choices"][0]["message"]["content"] or "").strip()
 
-# ---------------- API PRINCIPAL ----------------
+# ─────────────────────────────────────────────────────────────
+# API PRINCIPAL
+# ─────────────────────────────────────────────────────────────
 def answer_with_rag(query: str, top_k: int = 5) -> str:
+    """
+    Función SÍNCRONA (no usar await).
+    Hace: embed cloud → search Qdrant → LLM Groq.
+    """
     try:
         if not query or not query.strip():
             return "¿Podrías escribir tu pregunta?"
-        log.info(f"[RAG] HF model (cloud): {HF_EMBED_MODEL} | q='{query[:80]}'")
+        log.info("[RAG] HF model (nube): %s | q='%s'", HF_EMBED_MODEL, query[:80])
+
         qvec = _embed_query_cloud(query)
         docs = _search(qvec, top_k=top_k)
         if not docs:
             return "No encontré información sobre eso en la Cámara de Comercio de Pamplona."
+
         prompt = _build_prompt(query, docs)
         ans = _llm_answer(prompt)
         return ans or "No pude generar respuesta en este momento."
     except Exception as e:
-        log.exception(f"[RAG] Error: {e}")
+        log.exception("[RAG] Error: %s", e)
         return f"⚠️ Error en RAG: {e}"
