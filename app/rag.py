@@ -130,8 +130,12 @@ def _hf_client() -> InferenceClient:
 
 def hf_embed_texts_cloud(texts: List[str], model: str) -> List[List[float]]:
     """
-    Llama al router de HF para 'feature_extraction' con reintentos y fallbacks.
-    Usa firma compatible: primero text=..., y si falla, posicional.
+    Llama a HF con compatibilidad amplia:
+      1) firma nueva: text=..., pooling/normalize/truncate
+      2) firma nueva sin extras: text=...
+      3) firma mixta: inputs=...
+      4) firma antigua posicional: payload, model=...
+    Hace reintentos y fallbacks de modelos.
     """
     if not texts:
         return []
@@ -140,40 +144,40 @@ def hf_embed_texts_cloud(texts: List[str], model: str) -> List[List[float]]:
     last_err: Exception | None = None
     cli = _hf_client()
 
+    def _coerce(payload_any) -> List[List[float]]:
+        return _coerce_to_list_of_vectors(payload_any)
+
     for m in models_to_try:
-        # prefijos E5/GTE
+        # Prefijos E5/GTE
         tx = [_maybe_prefix(t, m) for t in texts]
         payload = tx[0] if len(tx) == 1 else tx
 
         for attempt in range(1, HF_RETRIES + 2):
             try:
-                # Firma nueva: text=...
+                # 1) firma "moderna" con extras
                 out = cli.feature_extraction(
                     model=m,
                     text=payload,
                     pooling="mean",
                     normalize=True,
                     truncate=True,
-                    timeout=HF_TIMEOUT,
+                    # algunos builds no aceptan timeout tampoco
                 )
-                vecs = _coerce_to_list_of_vectors(out)
+                vecs = _coerce(out)
                 if vecs:
                     if m != model:
                         log.info("[HF] usando modelo de respaldo: %s", m)
                     return vecs
                 raise RuntimeError("Salida vacía/no interpretable.")
-            except TypeError:
-                # Firma antigua: primer argumento posicional
+            except TypeError as e1:
+                last_err = e1
+                # 2) firma nueva SIN extras
                 try:
                     out = cli.feature_extraction(
-                        payload,
                         model=m,
-                        pooling="mean",
-                        normalize=True,
-                        truncate=True,
-                        timeout=HF_TIMEOUT,
+                        text=payload,
                     )
-                    vecs = _coerce_to_list_of_vectors(out)
+                    vecs = _coerce(out)
                     if vecs:
                         if m != model:
                             log.info("[HF] usando modelo de respaldo: %s", m)
@@ -181,6 +185,34 @@ def hf_embed_texts_cloud(texts: List[str], model: str) -> List[List[float]]:
                     raise RuntimeError("Salida vacía/no interpretable.")
                 except Exception as e2:
                     last_err = e2
+                    # 3) algunas versiones aceptan "inputs" en vez de "text"
+                    try:
+                        out = cli.feature_extraction(
+                            model=m,
+                            inputs=payload,
+                        )
+                        vecs = _coerce(out)
+                        if vecs:
+                            if m != model:
+                                log.info("[HF] usando modelo de respaldo: %s", m)
+                            return vecs
+                        raise RuntimeError("Salida vacía/no interpretable.")
+                    except Exception as e3:
+                        last_err = e3
+                        # 4) firma antigua: primer arg posicional
+                        try:
+                            out = cli.feature_extraction(
+                                payload,
+                                model=m,
+                            )
+                            vecs = _coerce(out)
+                            if vecs:
+                                if m != model:
+                                    log.info("[HF] usando modelo de respaldo: %s", m)
+                                return vecs
+                            raise RuntimeError("Salida vacía/no interpretable.")
+                        except Exception as e4:
+                            last_err = e4
             except Exception as e:
                 last_err = e
 
@@ -188,6 +220,7 @@ def hf_embed_texts_cloud(texts: List[str], model: str) -> List[List[float]]:
             time.sleep(1.2 * attempt)
 
     raise RuntimeError(f"HF embeddings falló: {last_err}")
+
 
 def _embed_query_cloud(text: str) -> List[float]:
     vecs = hf_embed_texts_cloud([text], HF_EMBED_MODEL)
