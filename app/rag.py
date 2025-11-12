@@ -7,7 +7,10 @@ import httpx
 from dotenv import load_dotenv, find_dotenv
 from qdrant_client import QdrantClient
 from huggingface_hub import InferenceClient
+from app.hf_embed import hf_embed
 
+# ...
+vectors = hf_embed(textos, model=HF_EMBED_MODEL, batch_size=32)
 # ─────────────────────────────────────────────────────────────
 # Carga .env solo si existe y SIN override (no pisar Render)
 # ─────────────────────────────────────────────────────────────
