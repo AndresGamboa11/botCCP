@@ -13,8 +13,10 @@ from app.settings import get_settings
 
 S = get_settings()
 
-HF_MODEL = "intfloat/multilingual-e5-small"
-HF_API = f"https://api-inference.huggingface.co/models/{HF_MODEL}"or "intfloat/multilingual-e5-small"
+HF_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
+"
+HF_API = f"https://api-inference.huggingface.co/models/{HF_MODEL}"or "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
+"
 HF_TOKEN = os.getenv("HF_API_TOKEN", "").strip()
 
 def _pool_to_sentence(vec_json):
