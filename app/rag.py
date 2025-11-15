@@ -133,6 +133,7 @@ def _embed_query(text: str) -> List[float]:
 def _search(qvec: List[float], top_k: int = 5) -> List[Dict[str, Any]]:
     client = _qdrant()
     hits = client.search(collection_name=QDRANT_COLLECTION, query_vector=qvec, limit=top_k)
+    log.info("🔎 Qdrant search → %d hits", len(hits))
     out: List[Dict[str, Any]] = []
     for h in hits:
         p = h.payload or {}
@@ -145,6 +146,7 @@ def _search(qvec: List[float], top_k: int = 5) -> List[Dict[str, Any]]:
             }
         )
     return out
+
 
 # ─────────────────────────────────────────────────────────────
 # Prompt
