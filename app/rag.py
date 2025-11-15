@@ -238,3 +238,30 @@ def answer_with_rag(query: str, top_k: int = 5) -> str:
     except Exception as e:
         log.exception("[RAG] Error: %s", e)
         return f"⚠️ Error en RAG: {e}"
+
+#--------------------------------------------------------------------
+
+def debug_qdrant_sample(limit: int = 3) -> Dict[str, Any]:
+    client = _qdrant()
+    coll_info = client.get_collection(QDRANT_COLLECTION)
+    records, _ = client.scroll(
+        collection_name=QDRANT_COLLECTION,
+        limit=limit,
+        with_payload=True,
+    )
+    sample = []
+    for r in records:
+        sample.append({
+            "id": r.id,
+            "text": (r.payload or {}).get("text", "")[:120],
+            "page": (r.payload or {}).get("page"),
+            "source": (r.payload or {}).get("source"),
+        })
+    return {
+        "collection": QDRANT_COLLECTION,
+        "vectors_size": coll_info.config.params.vectors.size,
+        "distance": coll_info.config.params.vectors.distance,
+        "points": coll_info.points_count,
+        "sample": sample,
+    }
+
