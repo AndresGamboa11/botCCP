@@ -79,52 +79,82 @@ def read_markdown_chunks(path: Path, max_chars: int = 600) -> List[str]:
     return chunks
 
 
+def _normalize_supported_models(raw_supported) -> List[str]:
+    """
+    Convierte lo que devuelva FastEmbed (str / dict / objeto raro)
+    a una lista de nombres de modelo (str).
+    """
+    names: List[str] = []
+    for m in raw_supported:
+        if isinstance(m, str):
+            names.append(m)
+        elif isinstance(m, dict):
+            # FastEmbed suele usar claves tipo "model" o "name"
+            name = m.get("model") or m.get("name") or m.get("id")
+            if name:
+                names.append(str(name))
+        else:
+            # Último recurso: cast a string
+            names.append(str(m))
+    # Eliminar duplicados conservando orden
+    seen = set()
+    unique: List[str] = []
+    for n in names:
+        if n not in seen:
+            seen.add(n)
+            unique.append(n)
+    return unique
+
+
 def create_embedder_with_fallback(preferred_model: str) -> Tuple[TextEmbedding, str]:
     """
     Crea un TextEmbedding usando un modelo soportado por FastEmbed.
-    - Intenta primero el modelo indicado en .env (si está soportado).
-    - Si no, prueba una lista de modelos recomendados.
-    - Si aún así no, usa el primero de la lista soportada.
+    - Intenta primero el modelo indicado en .env (si está en los soportados).
+    - Luego una lista de modelos recomendados.
+    - Luego recurre a cualquiera de los soportados.
     """
-    supported = TextEmbedding.list_supported_models()
+    raw_supported = TextEmbedding.list_supported_models()
+    supported_names = _normalize_supported_models(raw_supported)
+
     log.info("🧠 Modelos soportados por FastEmbed:")
-    for m in supported:
-        log.info(f"   • {m}")
+    for n in supported_names:
+        log.info(f"   • {n}")
 
     candidates: List[str] = []
 
-    # 1) Modelo que pusiste en .env (por ejemplo intfloat/multilingual-e5-small)
-    if preferred_model and preferred_model not in candidates:
+    # 1) Modelo que pusiste en .env
+    if preferred_model:
         candidates.append(preferred_model)
 
-    # 2) Modelos recomendados (multilingüe + uno estándar)
+    # 2) Modelos recomendados (multilingüe + algunos comunes)
     for m in (
-        "intfloat/multilingual-e5-base",      # multilingüe y suele estar soportado
+        "intfloat/multilingual-e5-base",
         "sentence-transformers/all-MiniLM-L6-v2",
         "BAAI/bge-small-en-v1.5",
     ):
         if m not in candidates:
             candidates.append(m)
 
-    # 3) Asegurar que haya al menos algún modelo soportado
-    for m in supported:
-        if m not in candidates:
-            candidates.append(m)
+    # 3) Añadir todos los soportados como últimos candidatos
+    for n in supported_names:
+        if n not in candidates:
+            candidates.append(n)
 
     last_err: Exception | None = None
 
-    for model_name in candidates:
-        if model_name not in supported:
-            log.warning(f"⚠ Modelo '{model_name}' NO está en la lista soportada de FastEmbed. Se omite.")
+    for name in candidates:
+        # Si tenemos lista de soportados, filtramos por ella
+        if supported_names and name not in supported_names:
+            log.warning(f"⚠ Modelo '{name}' no está en la lista soportada de FastEmbed. Se omite.")
             continue
         try:
-            log.info(f"🧠 Cargando modelo FastEmbed: {model_name}")
-            embedder = TextEmbedding(model_name=model_name)
-            log.info(f"✅ Usando modelo de embeddings: {model_name}")
-            return embedder, model_name
+            log.info(f"🧠 Cargando modelo FastEmbed: {name}")
+            embedder = TextEmbedding(model_name=name)
+            log.info(f"✅ Usando modelo de embeddings: {name}")
+            return embedder, name
         except Exception as e:
             last_err = e
-            log.warning(f"⚠ No se pudo inicializar modelo '{model_name}': {e}")
+            log.warning(f"⚠ No se pudo inicializar modelo '{name}': {e}")
 
     raise RuntimeError(
         f"No se pudo inicializar ningún modelo de embeddings. Último error: {last_err}"
@@ -144,7 +174,7 @@ def ensure_qdrant_collection(
 
     try:
         client.get_collection(collection_name)
-        # Si existe, podemos opcionalmente recrearla para limpiar datos antiguos:
+        # Si existe, la recreamos para limpiar datos antiguos:
         log.info(f"🔁 Colección '{collection_name}' ya existe, se recreará.")
         client.recreate_collection(
             collection_name=collection_name,
@@ -191,7 +221,6 @@ def upload_documents_to_qdrant(
             )
         )
 
-    # Subida en batch
     client.upload_points(
         collection_name=collection_name,
         points=points,
@@ -218,7 +247,7 @@ def main():
     knowledge_path = resolve_knowledge_path()
     chunks = read_markdown_chunks(knowledge_path, max_chars=600)
 
-    # Crear embedder con fallback
+    # Crear embedder con fallback robusto
     embedder, used_model = create_embedder_with_fallback(EMBED_MODEL_ENV)
     print(f"🧠 Modelo de embeddings FINAL: {used_model}")
 
