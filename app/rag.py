@@ -22,8 +22,7 @@ QDRANT_COLLECTION = (os.getenv("QDRANT_COLLECTION") or "ccp_docs").strip()
 
 # Hugging Face Inference (embeddings en la nube)
 HF_API_TOKEN      = (os.getenv("HF_API_TOKEN") or "").strip()
-HF_EMBED_MODEL    = (os.getenv("HF_EMBED_MODEL")
-                     or "intfloat/multilingual-e5-small").strip()
+EMBED_MODEL = (os.getenv("EMBED_MODEL") or "BAAI/bge-m3").strip()
 EMBED_BATCH       = int(os.getenv("EMBED_BATCH", "16"))  # batch pequeño
 
 # Groq (LLM Gemma)
