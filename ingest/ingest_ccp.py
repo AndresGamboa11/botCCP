@@ -107,6 +107,14 @@ def main():
         "EMBED_MODEL",
         "intfloat/multilingual-e5-small"  # por defecto 384 dims
     ).strip()
+    
+    print("🔎 DEBUG QDRANT_URL      :", QDRANT_URL)
+    print("🔎 DEBUG QDRANT_COLLECTION:", COLLECTION)
+    print("🔎 DEBUG EMBED_MODEL      :", EMBED_MODEL)
+
+    if "cloud.qdrant.io" not in QDRANT_URL:
+        print("⚠️ ATENCIÓN: QDRANT_URL no parece ser Qdrant Cloud, revisa tu .env")
+
 
     # Por defecto usamos el archivo .md que creaste
     default_path = os.path.join(root_dir(), "knowledge", "CCPAMPLONA.md")
