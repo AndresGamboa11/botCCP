@@ -6,11 +6,11 @@ import time
 import argparse
 from typing import List, Any, Iterable, Tuple, Optional
 
-from dotenv import load_dotenv
+from dotenv import load_dotenv, find_dotenv
 from qdrant_client import QdrantClient, models
 from fastembed import TextEmbedding
 
-# pypdf solo se usa si el archivo es PDF (opcional en tu entorno local)
+# pypdf solo se usa si el archivo es PDF (opcional en tu entorno)
 try:
     from pypdf import PdfReader
     _HAS_PDF = True
@@ -24,7 +24,13 @@ def root_dir() -> str:
 
 
 def load_env() -> None:
-    load_dotenv(os.path.join(root_dir(), ".env"), override=True)
+    """
+    Carga variables desde .env SOLO si existe y SIN pisar las que ya vienen
+    del entorno (Render, etc.).
+    """
+    dotenv_path = find_dotenv(usecwd=True)
+    if dotenv_path:
+        load_dotenv(dotenv_path, override=False)
 
 
 # -------- Limpieza y fragmentación de texto --------
@@ -102,19 +108,21 @@ def main():
     QDRANT_URL = os.getenv("QDRANT_URL", "").strip()
     QDRANT_API_KEY = os.getenv("QDRANT_API_KEY", "").strip()
     COLLECTION = os.getenv("QDRANT_COLLECTION", "ccp_docs").strip()
-    # IMPORTANTE: usa el mismo modelo (dimensión) que en el RAG.
     EMBED_MODEL = os.getenv(
         "EMBED_MODEL",
         "intfloat/multilingual-e5-small"  # por defecto 384 dims
     ).strip()
-    
+
+    # DEBUG para Render
     print("🔎 DEBUG QDRANT_URL      :", QDRANT_URL)
     print("🔎 DEBUG QDRANT_COLLECTION:", COLLECTION)
     print("🔎 DEBUG EMBED_MODEL      :", EMBED_MODEL)
+    if QDRANT_URL and "cloud.qdrant.io" not in QDRANT_URL:
+        print("⚠️ ATENCIÓN: QDRANT_URL no parece ser Qdrant Cloud:", QDRANT_URL)
 
-    if "cloud.qdrant.io" not in QDRANT_URL:
-        print("⚠️ ATENCIÓN: QDRANT_URL no parece ser Qdrant Cloud, revisa tu .env")
-
+    if not QDRANT_URL or not QDRANT_API_KEY:
+        print("❌ Faltan QDRANT_URL o QDRANT_API_KEY en .env / variables de entorno")
+        sys.exit(1)
 
     # Por defecto usamos el archivo .md que creaste
     default_path = os.path.join(root_dir(), "knowledge", "CCPAMPLONA.md")
@@ -145,9 +153,6 @@ def main():
     )
     args = parser.parse_args()
 
-    if not QDRANT_URL or not QDRANT_API_KEY:
-        print("❌ Faltan QDRANT_URL o QDRANT_API_KEY en .env")
-        sys.exit(1)
     if not os.path.exists(args.file):
         print(f"❌ No se encontró el archivo: {args.file}")
         sys.exit(1)
@@ -190,13 +195,12 @@ def main():
     print(f"☁️ Conectando a Qdrant Cloud: {QDRANT_URL}")
     client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, timeout=90)
 
+    # Mostrar colecciones actuales (debug)
     try:
         colls = client.get_collections()
-        print("📚 Colecciones actualmente en este endpoint:",
-              [c.name for c in colls.collections])
+        print("📚 Colecciones en este endpoint:", [c.name for c in colls.collections])
     except Exception as e:
-        print("❌ Error listando colecciones:", e)
-
+        print("⚠️ No se pudieron listar colecciones:", e)
 
     if not args.no_recreate:
         print(f"🧺 Recreando colección '{args.collection}'…")
