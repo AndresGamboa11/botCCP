@@ -190,6 +190,14 @@ def main():
     print(f"☁️ Conectando a Qdrant Cloud: {QDRANT_URL}")
     client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, timeout=90)
 
+    try:
+        colls = client.get_collections()
+        print("📚 Colecciones actualmente en este endpoint:",
+              [c.name for c in colls.collections])
+    except Exception as e:
+        print("❌ Error listando colecciones:", e)
+
+
     if not args.no_recreate:
         print(f"🧺 Recreando colección '{args.collection}'…")
         try:
