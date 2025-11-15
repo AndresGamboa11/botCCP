@@ -52,22 +52,25 @@ def _qdrant() -> QdrantClient:
 def _hf_embed_batch(texts: List[str]) -> List[List[float]]:
     """
     Envía un batch de textos a HF Inference API (nuevo router) y devuelve la lista de vectores.
-    Usa: https://router.huggingface.co/hf-inference/models/{HF_EMBED_MODEL}
+    Usa: https://router.huggingface.co/hf-inference/models/{model}/pipeline/feature-extraction
     """
     if not HF_API_TOKEN:
         raise RuntimeError("Falta HF_API_TOKEN en el entorno.")
     if not HF_EMBED_MODEL:
         raise RuntimeError("Falta HF_EMBED_MODEL en el entorno.")
 
-    # 👇 Nuevo endpoint recomendado por HF
-    url = f"https://router.huggingface.co/hf-inference/models/{HF_EMBED_MODEL}"
+    url = (
+        f"https://router.huggingface.co/hf-inference/models/"
+        f"{HF_EMBED_MODEL}/pipeline/feature-extraction"
+    )
     headers = {
         "Authorization": f"Bearer {HF_API_TOKEN}",
         "Accept": "application/json",
+        "Content-Type": "application/json",
     }
 
     payload = {
-        "inputs": texts,
+        "inputs": texts,                # lista de textos
         "options": {"wait_for_model": True},
     }
 
@@ -76,17 +79,16 @@ def _hf_embed_batch(texts: List[str]) -> List[List[float]]:
         try:
             r.raise_for_status()
         except httpx.HTTPStatusError as e:
-            log.error("HF Inference error %s: %s", e.response.status_code, e.response.text)
+            log.error("HF Inference error %s: %s", e.response.status_code, r.text)
             raise
 
         data = r.json()
         vecs: List[List[float]] = []
 
-        # Normalizamos el formato de salida
         if isinstance(data, list) and data and isinstance(data[0], list):
             for item in data:
                 if item and isinstance(item[0], list):
-                    # Embeddings por token → promedio
+                    # Embeddings por token → promediamos
                     dim = len(item[0])
                     summed = [0.0] * dim
                     for tok_vec in item:
@@ -95,12 +97,12 @@ def _hf_embed_batch(texts: List[str]) -> List[List[float]]:
                     vec = [v / float(len(item)) for v in summed]
                     vecs.append(vec)
                 else:
-                    # Ya es un vector por texto
                     vecs.append([float(v) for v in item])
         else:
-            raise RuntimeError(f"Formato inesperado de embeddings HF: {type(data)}")
+            raise RuntimeError(f"Formato inesperado de embeddings HF: {data}")
 
         return vecs
+
 
 
 def _embed_texts(texts: List[str]) -> List[List[float]]:
