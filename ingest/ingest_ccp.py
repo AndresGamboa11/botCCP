@@ -110,7 +110,7 @@ def main():
     COLLECTION = os.getenv("QDRANT_COLLECTION", "ccp_docs").strip()
     EMBED_MODEL = os.getenv(
         "EMBED_MODEL",
-        "intfloat/multilingual-e5-small"  # por defecto 384 dims
+        "BAAI/bge-m3"  # por defecto 384 dims
     ).strip()
 
     # DEBUG para Render
