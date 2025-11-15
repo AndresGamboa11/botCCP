@@ -21,14 +21,21 @@ QDRANT_API_KEY    = (os.getenv("QDRANT_API_KEY") or "").strip()
 QDRANT_COLLECTION = (os.getenv("QDRANT_COLLECTION") or "ccp_docs").strip()
 
 # Hugging Face Inference (embeddings en la nube)
-HF_API_TOKEN      = (os.getenv("HF_API_TOKEN") or "").strip()
-EMBED_MODEL = (os.getenv("EMBED_MODEL") or "BAAI/bge-m3").strip()
-EMBED_BATCH       = int(os.getenv("EMBED_BATCH", "16"))  # batch pequeño
+HF_API_TOKEN = (os.getenv("HF_API_TOKEN") or "").strip()
 
-# Groq (LLM Gemma)
-GROQ_API_KEY      = (os.getenv("GROQ_API_KEY") or "").strip()
-GROQ_MODEL        = (os.getenv("GROQ_MODEL") or "llama-3.1-8b-instant").strip()
+# Modelo HF usado para extracción de embeddings (consulta)
+HF_EMBED_MODEL = (
+    os.getenv("HF_EMBED_MODEL")                         # prioridad 1
+    or os.getenv("EMBED_MODEL")                         # prioridad 2
+    or "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"  # fallback seguro
+).strip()
 
+# Batching recomendado
+EMBED_BATCH = int(os.getenv("EMBED_BATCH", "16"))
+
+# Groq (Gemma / LLaMA)
+GROQ_API_KEY = (os.getenv("GROQ_API_KEY") or "").strip()
+GROQ_MODEL   = (os.getenv("GROQ_MODEL") or "llama-3.1-8b-instant").strip()
 
 # ─────────────────────────────────────────────────────────────
 # LOG
@@ -47,13 +54,10 @@ def _qdrant() -> QdrantClient:
     return QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, timeout=90)
 
 # ─────────────────────────────────────────────────────────────
-# Embeddings por API (Hugging Face Inference via router)
+# Embeddings via Hugging Face Inference API (nuevo router)
 # ─────────────────────────────────────────────────────────────
 def _hf_embed_batch(texts: List[str]) -> List[List[float]]:
-    """
-    Envía un batch de textos a HF Inference API (nuevo router) y devuelve la lista de vectores.
-    Usa: https://router.huggingface.co/hf-inference/models/{model}/pipeline/feature-extraction
-    """
+    """Envía un batch de textos a HF Inference API y devuelve vectores."""
     if not HF_API_TOKEN:
         raise RuntimeError("Falta HF_API_TOKEN en el entorno.")
     if not HF_EMBED_MODEL:
@@ -69,62 +73,52 @@ def _hf_embed_batch(texts: List[str]) -> List[List[float]]:
         "Content-Type": "application/json",
     }
 
-    payload = {
-        "inputs": texts,                # lista de textos
-        "options": {"wait_for_model": True},
-    }
+    payload = {"inputs": texts, "options": {"wait_for_model": True}}
 
     with httpx.Client(timeout=60) as cli:
         r = cli.post(url, headers=headers, json=payload)
         try:
             r.raise_for_status()
-        except httpx.HTTPStatusError as e:
-            log.error("HF Inference error %s: %s", e.response.status_code, r.text)
+        except httpx.HTTPStatusError:
+            log.error("HF error %s: %s", r.status_code, r.text)
             raise
 
         data = r.json()
         vecs: List[List[float]] = []
 
-        if isinstance(data, list) and data and isinstance(data[0], list):
+        if isinstance(data, list) and data:
             for item in data:
                 if item and isinstance(item[0], list):
-                    # Embeddings por token → promediamos
+                    # viene por tokens → promediamos
                     dim = len(item[0])
                     summed = [0.0] * dim
-                    for tok_vec in item:
-                        for i, val in enumerate(tok_vec):
-                            summed[i] += float(val)
-                    vec = [v / float(len(item)) for v in summed]
-                    vecs.append(vec)
+                    for tv in item:
+                        for i, v in enumerate(tv):
+                            summed[i] += float(v)
+                    avg = [v / len(item) for v in summed]
+                    vecs.append(avg)
                 else:
+                    # viene como embedding único
                     vecs.append([float(v) for v in item])
         else:
-            raise RuntimeError(f"Formato inesperado de embeddings HF: {data}")
+            raise RuntimeError(f"Formato inesperado HF: {data}")
 
         return vecs
 
 
-
 def _embed_texts(texts: List[str]) -> List[List[float]]:
-    if not texts:
-        return []
     all_vecs: List[List[float]] = []
     for i in range(0, len(texts), EMBED_BATCH):
-        chunk = texts[i : i + EMBED_BATCH]
+        chunk = texts[i:i + EMBED_BATCH]
         log.info("🧠 Incrustaciones HF (%s) lote %d-%d", HF_EMBED_MODEL, i, i + len(chunk))
-        try:
-            vecs = _hf_embed_batch(chunk)
-            all_vecs.extend(vecs)
-        except Exception as e:
-            log.exception("Error generando embeddings con HF: %s", e)
-            raise
-        time.sleep(0.2)
+        vecs = _hf_embed_batch(chunk)
+        all_vecs.extend(vecs)
+        time.sleep(0.25)  # evita 429
     return all_vecs
 
 
 def _embed_query(text: str) -> List[float]:
-    vecs = _embed_texts([text])
-    return vecs[0]
+    return _embed_texts([text])[0]
 
 # ─────────────────────────────────────────────────────────────
 # Búsqueda en Qdrant
@@ -133,29 +127,26 @@ def _search(qvec: List[float], top_k: int = 5) -> List[Dict[str, Any]]:
     client = _qdrant()
     hits = client.search(collection_name=QDRANT_COLLECTION, query_vector=qvec, limit=top_k)
     log.info("🔎 Qdrant search → %d hits", len(hits))
-    out: List[Dict[str, Any]] = []
+
+    results = []
     for h in hits:
         p = h.payload or {}
-        out.append(
-            {
-                "score": float(h.score),
-                "text": p.get("text", ""),
-                "page": p.get("page", None),
-                "source": p.get("source", ""),
-            }
-        )
-    return out
-
-
+        results.append({
+            "score": float(h.score),
+            "text": p.get("text", ""),
+            "page": p.get("page"),
+            "source": p.get("source", ""),
+        })
+    return results
 
 # ─────────────────────────────────────────────────────────────
 # Prompt
 # ─────────────────────────────────────────────────────────────
 SYSTEM = (
     "Eres el asistente oficial de la Cámara de Comercio de Pamplona (Colombia). "
-    "Responde SOLO sobre servicios, trámites, horarios y actividades de la Cámara. "
-    "Sé claro y específico, evita información inventada. "
-    "Si la respuesta no está en las fuentes, dilo de forma directa."
+    "Responde SOLO sobre servicios, trámites, horarios, tarifas y actividades. "
+    "Sé claro, breve, exacto. No inventes datos. "
+    "Si la información no está en el contexto, dilo directamente."
 )
 
 def _build_prompt(user_q: str, passages: List[Dict[str, Any]]) -> str:
@@ -164,22 +155,22 @@ def _build_prompt(user_q: str, passages: List[Dict[str, Any]]) -> str:
         snippet = (p["text"] or "").replace("\n", " ").strip()
         if snippet:
             ctx_lines.append(f"[{i}] {snippet}")
+
     ctx = "\n".join(ctx_lines[:8])
 
     return (
         f"{SYSTEM}\n\n"
-        f"Contexto (fragmentos de la Cámara de Comercio de Pamplona):\n{ctx}\n\n"
+        f"Contexto (fragmentos reales del conocimiento):\n{ctx}\n\n"
         f"Pregunta del usuario: {user_q}\n\n"
-        f"Instrucciones para la respuesta:\n"
-        f"- Usa SOLO la información del contexto.\n"
-        f"- Si hay horarios, direcciones o teléfonos, devuélvelos completos y actualizados.\n"
-        f"- Responde en un máximo de 5–7 líneas, formato WhatsApp, usando viñetas cuando ayude.\n"
-        f"- Si la información no aparece en el contexto, responde que no cuentas con esos datos.\n"
-        f"- No inventes enlaces ni promociones."
+        f"Instrucciones:\n"
+        f"- Usa SOLO lo que aparece en el contexto.\n"
+        f"- Si hay horarios, direcciones o teléfonos, respóndelos completos.\n"
+        f"- Estilo WhatsApp, 5–7 líneas máximo.\n"
+        f"- Si no está la información: dilo sin inventar.\n"
     )
 
 # ─────────────────────────────────────────────────────────────
-# LLM (Groq) — body mínimo para evitar 400
+# LLM (Groq)
 # ─────────────────────────────────────────────────────────────
 def _llm_answer(prompt: str) -> str:
     if not GROQ_API_KEY:
@@ -191,7 +182,6 @@ def _llm_answer(prompt: str) -> str:
         "Content-Type": "application/json",
     }
 
-    # 👇 Body mínimo y seguro: SOLO model + messages
     body = {
         "model": GROQ_MODEL,
         "messages": [
@@ -202,18 +192,7 @@ def _llm_answer(prompt: str) -> str:
 
     with httpx.Client(timeout=60) as cli:
         r = cli.post(url, headers=headers, json=body)
-        try:
-            r.raise_for_status()
-        except httpx.HTTPStatusError as e:
-            # Log completo del error de Groq para depurar
-            try:
-                err_txt = r.text
-            except Exception:
-                err_txt = "<sin cuerpo>"
-            log.error("Groq error %s: %s", e.response.status_code, err_txt)
-            # Mensaje amable para el usuario
-            raise
-
+        r.raise_for_status()
         data = r.json()
         return (data["choices"][0]["message"]["content"] or "").strip()
 
@@ -222,24 +201,25 @@ def _llm_answer(prompt: str) -> str:
 # ─────────────────────────────────────────────────────────────
 def answer_with_rag(query: str, top_k: int = 5) -> str:
     try:
-        if not query or not query.strip():
-            return "¿Podrías escribir tu pregunta?"
-        log.info("[RAG] Modelo HF (nube): %s | q='%s'", HF_EMBED_MODEL, query[:80])
+        if not query.strip():
+            return "Escribe tu pregunta."
+
+        log.info("[RAG] Modelo HF: %s | q='%s'", HF_EMBED_MODEL, query[:80])
 
         qvec = _embed_query(query)
         docs = _search(qvec, top_k=top_k)
+
         if not docs:
-            return "No encontré información sobre eso en la Cámara de Comercio de Pamplona."
+            return "No encontré información sobre ese tema dentro de la Cámara de Comercio de Pamplona."
 
         prompt = _build_prompt(query, docs)
         ans = _llm_answer(prompt)
-        return ans or "No pude generar respuesta en este momento."
+        return ans or "No pude generar una respuesta en este momento."
     except Exception as e:
         log.exception("[RAG] Error: %s", e)
         return f"⚠️ Error en RAG: {e}"
 
 #--------------------------------------------------------------------
-
 def debug_qdrant_sample(limit: int = 3) -> Dict[str, Any]:
     client = _qdrant()
     coll_info = client.get_collection(QDRANT_COLLECTION)
@@ -263,4 +243,3 @@ def debug_qdrant_sample(limit: int = 3) -> Dict[str, Any]:
         "points": coll_info.points_count,
         "sample": sample,
     }
-
