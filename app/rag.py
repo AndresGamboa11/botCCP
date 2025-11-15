@@ -23,17 +23,17 @@ QDRANT_COLLECTION = (os.getenv("QDRANT_COLLECTION") or "ccp_docs").strip()
 # Hugging Face Inference (embeddings en la nube)
 HF_API_TOKEN = (os.getenv("HF_API_TOKEN") or "").strip()
 
-# Modelo HF usado para extracción de embeddings (consulta)
+# 👇 ESTA LÍNEA ES LA CLAVE: definir HF_EMBED_MODEL
 HF_EMBED_MODEL = (
     os.getenv("HF_EMBED_MODEL")                         # prioridad 1
     or os.getenv("EMBED_MODEL")                         # prioridad 2
-    or "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"  # fallback seguro
+    or "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"  # fallback
 ).strip()
 
-# Batching recomendado
+# Tamaño de lote
 EMBED_BATCH = int(os.getenv("EMBED_BATCH", "16"))
 
-# Groq (Gemma / LLaMA)
+# Groq (LLM)
 GROQ_API_KEY = (os.getenv("GROQ_API_KEY") or "").strip()
 GROQ_MODEL   = (os.getenv("GROQ_MODEL") or "llama-3.1-8b-instant").strip()
 
@@ -44,6 +44,7 @@ log = logging.getLogger("rag")
 if not log.handlers:
     logging.basicConfig(level=logging.INFO)
 log.setLevel(logging.INFO)
+
 
 # ─────────────────────────────────────────────────────────────
 # Qdrant
