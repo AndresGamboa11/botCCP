@@ -1,264 +1,52 @@
-# ingest/ingest_ccp.py
-import os
-import sys
-import uuid
-import time
-import argparse
-from typing import List, Any, Iterable, Tuple, Optional
+# ingest/ingest_ccp.py (fragmento relevante)
 
-from dotenv import load_dotenv, find_dotenv
-from qdrant_client import QdrantClient, models
+import os
+import logging
 from fastembed import TextEmbedding
 
-# pypdf solo se usa si el archivo es PDF (opcional en tu entorno)
-try:
-    from pypdf import PdfReader
-    _HAS_PDF = True
-except Exception:
-    _HAS_PDF = False
+logger = logging.getLogger("ingest")
+
+# ─────────────────────────────────────────────
+# ENV: modelo de embeddings
+# ─────────────────────────────────────────────
+# Modelo por defecto recomendado (multilingüe, 384 dims)
+DEFAULT_EMBED_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+
+EMBED_MODEL = (os.getenv("EMBED_MODEL") or DEFAULT_EMBED_MODEL).strip()
 
 
-# -------- Utilidades de entorno / paths --------
-def root_dir() -> str:
-    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
-
-def load_env() -> None:
+def create_embedder_safe() -> TextEmbedding:
     """
-    Carga variables desde .env SOLO si existe y SIN pisar las que ya vienen
-    del entorno (Render, etc.).
+    Crea el modelo de FastEmbed, y si el que viene por env no está soportado,
+    hace fallback a DEFAULT_EMBED_MODEL.
     """
-    dotenv_path = find_dotenv(usecwd=True)
-    if dotenv_path:
-        load_dotenv(dotenv_path, override=False)
-
-
-# -------- Limpieza y fragmentación de texto --------
-def clean_text(s: str) -> str:
-    if not s:
-        return ""
-    s = s.replace("\x00", " ")
-    s = "\n".join(line.strip() for line in s.splitlines())
-    return " ".join(s.split())
-
-
-def chunk_text(text: str, max_chars: int = 800, overlap: int = 120) -> List[str]:
-    """
-    Divide un texto largo en fragmentos solapados.
-    """
-    text = clean_text(text)
-    if not text:
-        return []
-    if len(text) <= max_chars:
-        return [text]
-
-    chunks: List[str] = []
-    start = 0
-    step = max_chars - overlap if max_chars > overlap else max_chars
-    while start < len(text):
-        end = min(start + max_chars, len(text))
-        chunks.append(text[start:end])
-        if end == len(text):
-            break
-        start += step
-    return chunks
-
-
-def chunk_pdf_by_page(reader: "PdfReader", max_chars: int = 800, overlap: int = 120) -> List[Tuple[str, int]]:
-    """
-    Extrae texto por página de un PDF y lo fragmenta.
-    Devuelve lista de (fragmento, número_de_página).
-    """
-    results: List[Tuple[str, int]] = []
-    for i, page in enumerate(reader.pages, start=1):
-        page_text = clean_text(page.extract_text() or "")
-        if not page_text:
-            continue
-        for ch in chunk_text(page_text, max_chars=max_chars, overlap=overlap):
-            results.append((ch, i))
-    return results
-
-
-def chunk_text_file(path: str, max_chars: int = 800, overlap: int = 120) -> List[Tuple[str, Optional[int]]]:
-    """
-    Lee un archivo de texto (.md, .txt, etc.) y lo fragmenta.
-    Devuelve lista de (fragmento, None) ya que no hay páginas.
-    """
-    with open(path, "r", encoding="utf-8") as f:
-        text = f.read()
-    chunks = chunk_text(text, max_chars=max_chars, overlap=overlap)
-    return [(ch, None) for ch in chunks]
-
-
-def batched(iterable: Iterable[Any], n: int) -> Iterable[List[Any]]:
-    batch: List[Any] = []
-    for item in iterable:
-        batch.append(item)
-        if len(batch) >= n:
-            yield batch
-            batch = []
-    if batch:
-        yield batch
-
-
-# ---------------- Ingesta principal ----------------
-def main():
-    load_env()
-
-    QDRANT_URL = os.getenv("QDRANT_URL", "").strip()
-    QDRANT_API_KEY = os.getenv("QDRANT_API_KEY", "").strip()
-    COLLECTION = os.getenv("QDRANT_COLLECTION", "ccp_docs").strip()
-    EMBED_MODEL = os.getenv(
-        "EMBED_MODEL",
-        "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"  # por defecto 384 dims
-    ).strip()
-
-    # DEBUG para Render
-    print("🔎 DEBUG QDRANT_URL      :", QDRANT_URL)
-    print("🔎 DEBUG QDRANT_COLLECTION:", COLLECTION)
-    print("🔎 DEBUG EMBED_MODEL      :", EMBED_MODEL)
-    if QDRANT_URL and "cloud.qdrant.io" not in QDRANT_URL:
-        print("⚠️ ATENCIÓN: QDRANT_URL no parece ser Qdrant Cloud:", QDRANT_URL)
-
-    if not QDRANT_URL or not QDRANT_API_KEY:
-        print("❌ Faltan QDRANT_URL o QDRANT_API_KEY en .env / variables de entorno")
-        sys.exit(1)
-
-    # Por defecto usamos el archivo .md que creaste
-    default_path = os.path.join(root_dir(), "knowledge", "CCPAMPLONA.md")
-
-    parser = argparse.ArgumentParser(
-        description="Ingesta de archivo (.md o .pdf) a Qdrant Cloud (FastEmbed local)"
-    )
-    parser.add_argument(
-        "--file",
-        default=default_path,
-        help="Ruta del archivo de conocimiento (default: knowledge/CCPAMPLONA.md)",
-    )
-    parser.add_argument(
-        "--collection",
-        default=COLLECTION,
-        help="Nombre de colección (default: ccp_docs)",
-    )
-    parser.add_argument(
-        "--no-recreate",
-        action="store_true",
-        help="No recrear la colección si ya existe",
-    )
-    parser.add_argument(
-        "--batch-size",
-        type=int,
-        default=64,
-        help="Tamaño de lote para upsert a Qdrant",
-    )
-    args = parser.parse_args()
-
-    if not os.path.exists(args.file):
-        print(f"❌ No se encontró el archivo: {args.file}")
-        sys.exit(1)
-
-    ext = os.path.splitext(args.file)[1].lower()
-    print(f"📄 Leyendo archivo: {args.file}")
-
-    # -------- Obtener fragmentos (texto + página opcional) --------
-    if ext == ".pdf":
-        if not _HAS_PDF:
-            print("❌ El archivo es PDF pero pypdf no está instalado en este entorno.")
-            sys.exit(1)
-        reader = PdfReader(args.file)
-        chunks_with_page: List[Tuple[str, Optional[int]]] = chunk_pdf_by_page(
-            reader, max_chars=800, overlap=120
-        )
-    else:
-        # .md, .txt, etc.
-        chunks_with_page = chunk_text_file(args.file, max_chars=800, overlap=120)
-
-    if not chunks_with_page:
-        print("⚠️ El archivo no tiene texto útil para indexar.")
-        sys.exit(1)
-
-    chunks = [c for c, _ in chunks_with_page]
-    print(f"✅ Fragmentos: {len(chunks)}")
-
-    # -------- Embeddings con FastEmbed (local) --------
-    print(f"🧠 Cargando modelo FastEmbed: {EMBED_MODEL}")
-    embedder = TextEmbedding(model_name=EMBED_MODEL)
-
-    vectors = [v.tolist() for v in embedder.embed(chunks)]
-    if not vectors:
-        print("❌ No se generaron embeddings")
-        sys.exit(1)
-    vector_dim = len(vectors[0])
-    print(f"   • Dimensión de vector: {vector_dim}")
-
-    # -------- Conexión a Qdrant --------
-    print(f"☁️ Conectando a Qdrant Cloud: {QDRANT_URL}")
-    client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, timeout=90)
-
-    # Mostrar colecciones actuales (debug)
     try:
-        colls = client.get_collections()
-        print("📚 Colecciones en este endpoint:", [c.name for c in colls.collections])
+        modelos = TextEmbedding.list_supported_models()
+        soportados = {m["model"] for m in modelos}
     except Exception as e:
-        print("⚠️ No se pudieron listar colecciones:", e)
+        logger.warning(f"[FastEmbed] No se pudo listar modelos soportados: {e}")
+        modelos = []
+        soportados = set()
 
-    if not args.no_recreate:
-        print(f"🧺 Recreando colección '{args.collection}'…")
-        try:
-            client.get_collection(args.collection)
-            client.delete_collection(args.collection)
-        except Exception:
-            pass
-        client.create_collection(
-            collection_name=args.collection,
-            vectors_config=models.VectorParams(
-                size=vector_dim,
-                distance=models.Distance.COSINE,
-            ),
+    if soportados and EMBED_MODEL not in soportados:
+        logger.warning(
+            f"[FastEmbed] Modelo '{EMBED_MODEL}' NO soportado. "
+            f"Haciendo fallback a '{DEFAULT_EMBED_MODEL}'."
         )
+        # Si quieres, aquí también puedes imprimir algunos modelos recomendados
+        modelos_multilingues = [
+            m for m in modelos
+            if "multilingual" in m.get("description", "").lower()
+            or "paraphrase-multilingual" in m.get("model", "")
+        ]
+        if modelos_multilingues:
+            logger.info("[FastEmbed] Modelos multilingües disponibles:")
+            for m in modelos_multilingues:
+                logger.info(f"  - {m['model']} (dim={m['dim']})")
+
+        model_name = DEFAULT_EMBED_MODEL
     else:
-        try:
-            client.get_collection(args.collection)
-            print(f"📦 Usando colección existente: {args.collection}")
-        except Exception:
-            print(f"📦 Colección no existe. Creando '{args.collection}'…")
-            client.create_collection(
-                collection_name=args.collection,
-                vectors_config=models.VectorParams(
-                    size=vector_dim,
-                    distance=models.Distance.COSINE,
-                ),
-            )
+        model_name = EMBED_MODEL or DEFAULT_EMBED_MODEL
 
-    # -------- Subir puntos --------
-    print("⬆️ Subiendo puntos…")
-    sent, total = 0, len(chunks)
-    t0 = time.time()
-    for batch in batched(list(zip(chunks_with_page, vectors)), args.batch_size):
-        ids = [str(uuid.uuid4()) for _ in batch]
-        vecs = [v for (_, v) in batch]
-        payloads = []
-        for ((ch, pg), _) in batch:
-            payloads.append(
-                {
-                    "text": ch,
-                    "page": pg,  # puede ser None para .md
-                    "source": os.path.basename(args.file),
-                }
-            )
-        client.upsert(
-            collection_name=args.collection,
-            points=models.Batch(ids=ids, vectors=vecs, payloads=payloads),
-        )
-        sent += len(ids)
-        print(f"   • {sent}/{total}")
-
-    count = client.count(args.collection, exact=True).count
-    print(
-        f"✅ Ingesta completada. Colección: {args.collection} | "
-        f"Puntos: {count} | ⏱ {time.time() - t0:.1f}s"
-    )
-
-
-if __name__ == "__main__":
-    main()
+    print(f"🧠 Cargando modelo FastEmbed: {model_name}")
+    return TextEmbedding(model_name=model_name)
