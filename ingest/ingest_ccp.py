@@ -49,4 +49,8 @@ def create_embedder_safe() -> TextEmbedding:
         model_name = EMBED_MODEL or DEFAULT_EMBED_MODEL
 
     print(f"🧠 Cargando modelo FastEmbed: {model_name}")
+    print(f"🔎 DEBUG EMBED_MODEL      : {EMBED_MODEL}")
+    print(f"🧠 Preparando modelo FastEmbed...")
+
+    embedder = create_embedder_safe()
     return TextEmbedding(model_name=model_name)
