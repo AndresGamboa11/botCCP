@@ -2,7 +2,7 @@
 import os, json, logging, re
 import httpx
 import pandas as pd
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Query
 from fastapi.responses import JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from dotenv import load_dotenv, find_dotenv
@@ -303,15 +303,15 @@ WA_VERIFY_TOKEN = (os.getenv("WA_VERIFY_TOKEN") or "").strip()
 # 1) Verificación webhook (GET)
 @app.get("/webhook")
 async def verify_webhook(
-    mode: str = "",
-    hub_mode: str = "",
-    hub_challenge: str = "",
-    hub_verify_token: str = "",
+    hub_mode: str = Query(None, alias="hub.mode"),
+    hub_verify_token: str = Query(None, alias="hub.verify_token"),
+    hub_challenge: str = Query(None, alias="hub.challenge"),
 ):
-    _mode = (mode or hub_mode or "").lower()
-    _token = (hub_verify_token or "").strip()
+    mode = (hub_mode or "").lower()
+    token = (hub_verify_token or "").strip()
 
-    if _mode == "subscribe" and WA_VERIFY_TOKEN and _token == WA_VERIFY_TOKEN:
+    if mode == "subscribe" and WA_VERIFY_TOKEN and token == WA_VERIFY_TOKEN:
+        # Meta espera que devolvamos el challenge en texto plano
         return PlainTextResponse(hub_challenge or "OK", status_code=200)
 
     return PlainTextResponse("Forbidden", status_code=403)
@@ -364,7 +364,7 @@ def _extract_wa_message(payload: dict):
 
 # 3) Recepción del webhook (POST)
 @app.post("/webhook")
-async def receive_webhook(request: Request):  ##
+async def receive_webhook(request: Request):
     try:
         payload = await request.json()
     except Exception:
